@@ -285,12 +285,6 @@ curl -X POST http://localhost:8000/v1/restore \
 
 ---
 
-## License
-
-MIT
-
----
-
 ## Status
 
 ⚠️ **Early stage / MVP.** Actively seeking feedback. If you're building multi-agent systems, we'd love to hear from you.
