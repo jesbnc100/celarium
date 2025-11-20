@@ -1,23 +1,20 @@
 import uvicorn
 import os
 import uuid
-from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Security, status
+import re
+import random
+import json
+from datetime import datetime
+from typing import Union, List, Dict, Any
+from fastapi import FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from presidio_analyzer import AnalyzerEngine
 from faker import Faker
+from gliner import GLiNER
 
-# ============ CONFIG ============
+app = FastAPI(title="Celarium AI")
 
-app = FastAPI(
-    title="Celarium AI",
-    description="Privacy middleware for multi-agent LLM systems",
-    version="0.1.0",
-)
-
-# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,44 +24,163 @@ app.add_middleware(
 )
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-# API Keys (hardcoded for MVP)
-VALID_API_KEYS = {
-    "sk_test_celarium_founder_001",
-    "sk_test_celarium_beta_001",
-    "sk_test_celarium_beta_002",
-}
-
-# Sessions store (in-memory, expires after 1 hour)
+VALID_API_KEYS = {"sk_test_celarium_founder_001", "sk_test_celarium_beta_001"}
 SESSIONS = {}
-
-# ============ INIT ============
-
 fake = Faker()
-analyzer = AnalyzerEngine()
+
+# Load Model
+print("Loading GLiNER...")
+model = GLiNER.from_pretrained("urchade/gliner_small-v2.1")
+print("Loaded.")
+
+# Regex & Labels
+REGEX_PATTERNS = {
+    "EMAIL_ADDRESS": r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+    "PHONE_NUMBER": r'(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
+    "MRN": r'\bMRN[-_]\w+\b',
+    "SSN": r'\b\d{3}-\d{2}-\d{4}\b',
+    "INSURANCE_GROUP": r'\bG\d{5,}\b',
+    "INSURANCE_POLICY": r'\b(POL|POLICY)[-_]?\d+\b',
+    "FULL_ADDRESS": r'\d+\s+[A-Za-z0-9\s\.]+,\s+[A-Za-z\s\.]+,\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?'
+}
+AI_LABELS = ["person", "physical address", "organization", "date of birth"]
 
 
-# ============ AUTH ============
+# Generators
+def generate_clean_name():
+    return f"{fake.first_name()} {fake.last_name()}"
+
+
+def generate_matching_email(fake_name: str):
+    if not fake_name: return f"user{random.randint(1000, 9999)}@example.com"
+    parts = fake_name.lower().split()
+    base = f"{parts[0]}{parts[1]}" if len(parts) >= 2 else parts[0]
+    return f"{base}{random.randint(100, 9999)}@example.com"
+
+
+# --- UPDATED GENERATORS ---
+
+def generate_clean_phone():
+    """Matches the requested format: +1-XXX-XXX-XXXX"""
+    return f"+1-{random.randint(200, 999)}-{random.randint(200, 999)}-{random.randint(1000, 9999)}"
+
+
+def generate_medical_org():
+    """Generates realistic Healthcare/Clinical names"""
+    suffixes = [
+        "Medical Center", "Regional Health", "General Hospital",
+        "Health Group", "Family Clinic", "Community Care",
+        "Medical Associates", "Health System", "Diagnostics Lab"
+    ]
+    # 50% chance of City-based name (e.g. "Austin Regional Health")
+    # 50% chance of Name-based name (e.g. "Rivera Medical Group")
+    prefix = fake.city() if random.random() > 0.5 else fake.last_name()
+    return f"{prefix} {random.choice(suffixes)}"
+
+
+def get_fake_value(label: str, context: dict) -> str:
+    label = label.upper()
+
+    if "PERSON" in label:
+        val = generate_clean_name()
+        context["last_person"] = val
+        return val
+
+    if "EMAIL" in label:
+        return generate_matching_email(context.get("last_person", ""))
+
+    if "PHONE" in label:
+        return generate_clean_phone()  # <--- Uses new format
+
+    if "ADDRESS" in label or "LOCATION" in label:
+        # Fixes address leak by generating full block
+        return f"{fake.street_address()}, {fake.city()}, {fake.state_abbr()} {fake.zipcode()}"
+
+    if "MRN" in label:
+        return f"MRN-{fake.random_number(digits=8, fix_len=True)}"
+    if "SSN" in label:
+        return fake.ssn()
+    if "DATE" in label:
+        return str(fake.date_of_birth(minimum_age=18, maximum_age=90))
+    if "POLICY" in label:
+        return f"POL-{fake.random_number(digits=9, fix_len=True)}"
+    if "GROUP" in label:
+        return f"G{fake.random_number(digits=5, fix_len=True)}"
+
+    if "ORGANIZATION" in label:
+        return generate_medical_org()  # <--- Uses new medical generator
+
+    return f"REDACTED_{uuid.uuid4().hex[:6]}"
+
+
+def analyze_and_replace(text: str) -> (str, dict):
+    """Core logic to anonymize a single string block"""
+    findings = []
+    # Regex
+    for label, pattern in REGEX_PATTERNS.items():
+        for match in re.finditer(pattern, text):
+            findings.append({"start": match.start(), "end": match.end(), "label": label, "score": 1.0})
+    # AI
+    try:
+        ai_preds = model.predict_entities(text, AI_LABELS, threshold=0.35)
+        for p in ai_preds:
+            findings.append({"start": p["start"], "end": p["end"], "label": p["label"], "score": p["score"]})
+    except:
+        pass
+
+    # Merge
+    findings.sort(key=lambda x: x["start"])
+    merged = []
+    for f in findings:
+        if not merged:
+            merged.append(f)
+            continue
+        last = merged[-1]
+        if f["start"] < last["end"]:
+            if f["score"] > last["score"] or (f["end"] - f["start"]) > (last["end"] - last["start"]):
+                merged[-1] = f
+        else:
+            merged.append(f)
+
+    # Generate Fakes
+    mapping = {}
+    replacements = []
+    context = {"last_person": ""}
+    used_fakes = set()
+
+    for ent in merged:
+        original = text[ent["start"]:ent["end"]]
+        # Skip JSON Keys
+        if original.lower() in ["person_name", "date_of_birth", "ssn", "mrn", "email", "phone", "address"]:
+            continue
+
+        fake_val = get_fake_value(ent["label"], context)
+        if fake_val in used_fakes:
+            fake_val = f"{fake_val}_{random.randint(1, 99)}"
+        used_fakes.add(fake_val)
+
+        mapping[fake_val] = original
+        replacements.append({"start": ent["start"], "end": ent["end"], "fake": fake_val})
+
+    # Replace
+    replacements.sort(key=lambda x: x["start"], reverse=True)
+    text_chars = list(text)
+    for r in replacements:
+        text_chars[r["start"]:r["end"]] = list(r["fake"])
+
+    return "".join(text_chars), mapping
+
+
+# --- ENDPOINTS ---
 
 async def get_api_key(api_key: str = Security(api_key_header)):
     if not api_key or api_key not in VALID_API_KEYS:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API Key"
-        )
+        raise HTTPException(401, "Invalid API Key")
     return api_key
 
 
-# ============ DATA MODELS ============
-
 class AnonymizeRequest(BaseModel):
-    text: str
-
-
-class AnonymizeResponse(BaseModel):
-    anonymized_text: str
-    session_id: str
-    entities_found: int
+    text: Union[str, List[Any], Dict[str, Any]]
 
 
 class RestoreRequest(BaseModel):
@@ -72,238 +188,52 @@ class RestoreRequest(BaseModel):
     text: str
 
 
-class RestoreResponse(BaseModel):
-    restored_text: str
+@app.post("/v1/anonymize")
+async def anonymize(req: AnonymizeRequest, api_key: str = Security(get_api_key)):
+    input_data = req.text
+    global_mapping = {}
+    final_output_str = ""
 
+    # LOGIC: Handle List vs Single String
+    if isinstance(input_data, list):
+        # Process each item individually to avoid Token Limit
+        anonymized_list = []
+        for item in input_data:
+            item_str = json.dumps(item)
+            anon_str, item_map = analyze_and_replace(item_str)
+            anonymized_list.append(json.loads(anon_str))  # Convert back to dict
+            global_mapping.update(item_map)
 
-class HealthResponse(BaseModel):
-    status: str
-    version: str
-
-
-# ============ CORE LOGIC ============
-
-def generate_fake_value(entity_type: str, used_fakes: set) -> str:
-    """Generate a realistic fake value based on entity type"""
-    max_attempts = 10
-
-    if entity_type == "PERSON":
-        for _ in range(max_attempts):
-            fake_val = fake.name()
-            if fake_val not in used_fakes:
-                return fake_val
-        return f"Person_{str(uuid.uuid4())[:8]}"
-
-    elif entity_type == "EMAIL_ADDRESS":
-        for _ in range(max_attempts):
-            fake_val = fake.email()
-            if fake_val not in used_fakes:
-                return fake_val
-        return f"user_{str(uuid.uuid4())[:8]}@example.com"
-
-    elif entity_type == "PHONE_NUMBER":
-        for _ in range(max_attempts):
-            fake_val = fake.phone_number()
-            if fake_val not in used_fakes:
-                return fake_val
-        return f"+1-555-{str(uuid.uuid4())[:4]}"
-
-    elif entity_type == "US_SSN":
-        for _ in range(max_attempts):
-            fake_val = fake.ssn()
-            if fake_val not in used_fakes:
-                return fake_val
-        return f"{str(uuid.uuid4())[:3]}-{str(uuid.uuid4())[:2]}-{str(uuid.uuid4())[:4]}"
-
-    elif entity_type == "LOCATION":
-        for _ in range(max_attempts):
-            fake_val = fake.city()
-            if fake_val not in used_fakes:
-                return fake_val
-        return f"City_{str(uuid.uuid4())[:8]}"
-
-    elif entity_type == "DATE_TIME":
-        for _ in range(max_attempts):
-            fake_val = str(fake.date())
-            if fake_val not in used_fakes:
-                return fake_val
-        return "1990-01-01"
-
-    elif entity_type == "URL":
-        for _ in range(max_attempts):
-            fake_val = fake.url()
-            if fake_val not in used_fakes:
-                return fake_val
-        return "https://example.com"
+        # Return as formatted JSON string
+        final_output_str = json.dumps(anonymized_list, indent=2)
 
     else:
-        # Generic: use entity type with UUID
-        fake_val = f"{entity_type}_{str(uuid.uuid4())[:8]}"
-        return fake_val
+        # Single object or string
+        text_to_process = json.dumps(input_data) if isinstance(input_data, dict) else str(input_data)
+        final_output_str, global_mapping = analyze_and_replace(text_to_process)
 
-
-def anonymize_logic(text: str):
-    """
-    Detect PII with Presidio, replace with realistic fakes.
-    Handles overlaps by preferring longer spans.
-    Returns (anonymized_text, mapping) where mapping maps fake_value -> original_value.
-    """
-    try:
-        analyzer_results = analyzer.analyze(text=text, language="en")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-    if not analyzer_results:
-        return text, {}
-
-    # Convert to tuples and sort by start position (ascending), then by span length (descending)
-    spans = [(r.start, r.end, r.entity_type) for r in analyzer_results]
-    spans.sort(key=lambda x: (x[0], -(x[1] - x[0])))
-
-    # Merge overlapping spans, preferring longer ones
-    merged = []
-    for start, end, etype in spans:
-        if not merged:
-            merged.append((start, end, etype))
-            continue
-
-        last_start, last_end, last_type = merged[-1]
-        if start < last_end:  # overlapping
-            # Keep the longer span
-            if (end - start) > (last_end - last_start):
-                merged[-1] = (start, end, etype)
-        else:
-            merged.append((start, end, etype))
-
-    # Build anonymized text by replacing spans with fake values
-    cursor = 0
-    parts = []
-    mapping = {}
-    used_fakes = set()
-
-    for start, end, etype in merged:
-        # Append text before this span (preserves spacing/punctuation)
-        if cursor < start:
-            parts.append(text[cursor:start])
-
-        original_value = text[start:end]
-
-        # Generate realistic fake replacement
-        fake_value = generate_fake_value(etype, used_fakes)
-        used_fakes.add(fake_value)
-
-        # Append fake replacement
-        parts.append(fake_value)
-
-        # Record mapping for restoration
-        mapping[fake_value] = original_value
-
-        cursor = end
-
-    # Append remaining text
-    if cursor < len(text):
-        parts.append(text[cursor:])
-
-    anonymized_text = "".join(parts)
-    return anonymized_text, mapping
-
-
-def create_session(mapping: dict, api_key: str) -> str:
-    """Create a session and store mapping server-side"""
     session_id = str(uuid.uuid4())
-    SESSIONS[session_id] = {
-        "mapping": mapping,
-        "created": datetime.now(),
-        "api_key": api_key
+    SESSIONS[session_id] = {"mapping": global_mapping, "created": datetime.now(), "api_key": api_key}
+
+    return {
+        "anonymized_text": final_output_str,
+        "session_id": session_id,
+        "entities_found": len(global_mapping)
     }
-    return session_id
 
 
-def get_session(session_id: str, api_key: str) -> dict:
-    """Retrieve session mapping, validate expiration"""
-    session = SESSIONS.get(session_id)
-
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    if session["api_key"] != api_key:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if datetime.now() - session["created"] > timedelta(hours=1):
-        del SESSIONS[session_id]
-        raise HTTPException(status_code=410, detail="Session expired")
-
-    return session
-
-
-def restore_logic(mapping: dict, text: str) -> str:
-    """Swap fake values back to originals"""
-    restored = text
-    for fake_val, real_val in mapping.items():
-        restored = restored.replace(fake_val, real_val)
-    return restored
-
-
-# ============ ENDPOINTS ============
-
-@app.get("/health", response_model=HealthResponse)
-async def health():
-    """Health check"""
-    return HealthResponse(status="ok", version="0.1.0")
-
-
-@app.post("/v1/anonymize", response_model=AnonymizeResponse)
-async def anonymize(req: AnonymizeRequest, api_key: str = Security(get_api_key)):
-    """
-    Anonymize PII in text. Returns anonymized text + session ID.
-    Session ID is used to restore original values later.
-    """
-    if not req.text or not req.text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty")
-
-    anonymized_text, mapping = anonymize_logic(req.text)
-    session_id = create_session(mapping, api_key)
-
-    return AnonymizeResponse(
-        anonymized_text=anonymized_text,
-        session_id=session_id,
-        entities_found=len(mapping)
-    )
-
-
-@app.post("/v1/restore", response_model=RestoreResponse)
+@app.post("/v1/restore")
 async def restore(req: RestoreRequest, api_key: str = Security(get_api_key)):
-    """
-    Restore original PII using session ID.
-    Replaces anonymized values with originals.
-    """
-    if not req.session_id or not req.text:
-        raise HTTPException(status_code=400, detail="session_id and text required")
+    session = SESSIONS.get(req.session_id)
+    if not session or session["api_key"] != api_key:
+        raise HTTPException(404, "Session not found")
 
-    session = get_session(req.session_id, api_key)
-    mapping = session["mapping"]
+    restored = req.text
+    for fake_v, real_v in session["mapping"].items():
+        restored = restored.replace(fake_v, real_v)
 
-    restored_text = restore_logic(mapping, req.text)
+    return {"restored_text": restored}
 
-    return RestoreResponse(restored_text=restored_text)
-
-
-@app.delete("/v1/sessions/{session_id}")
-async def delete_session(session_id: str, api_key: str = Security(get_api_key)):
-    """Manually delete a session"""
-    session = SESSIONS.get(session_id)
-
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    if session["api_key"] != api_key:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    del SESSIONS[session_id]
-    return {"status": "deleted"}
-
-
-# ============ RUN ============
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
