@@ -228,11 +228,90 @@ async def restore(req: RestoreRequest, api_key: str = Security(get_api_key)):
     if not session or session["api_key"] != api_key:
         raise HTTPException(404, "Session not found")
 
-    restored = req.text
-    for fake_v, real_v in session["mapping"].items():
-        restored = restored.replace(fake_v, real_v)
+    text = req.text
+    mapping = session["mapping"]
 
-    return {"restored_text": restored}
+    # --- Helper: Normalize text to just digits for phone matching ---
+    def get_digits(s):
+        return "".join(filter(str.isdigit, s))
+
+    # --- 1. Exact Match (Highest Priority) ---
+    # Sort by length (longest first) to prevent substring collisions
+    # e.g. Replace "Joanna Torres" before "Joanna"
+    for fake, real in sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True):
+        text = text.replace(fake, real)
+
+    # --- 2. Build Partial Mappings (Smart Repair) ---
+    partial_map = {}
+    phone_map = {}
+
+    for fake_full, real_full in mapping.items():
+        # A. Phone Numbers: Map digits -> Real Number
+        # If the fake value has 10+ digits, store it for fuzzy matching
+        f_digits = get_digits(fake_full)
+        if len(f_digits) >= 10:
+            phone_map[f_digits] = real_full
+
+        # B. Names & Organizations: Split into parts
+        if " " in fake_full:
+            fake_parts = fake_full.split()
+            real_parts = real_full.split()
+
+            # Strategy 1: 1-to-1 Word Mapping (Best for Names: "John Doe" -> "Jane Smith")
+            if len(fake_parts) == len(real_parts):
+                for i, f_part in enumerate(fake_parts):
+                    # Only map parts that look like names (Capitalized, >2 chars) to avoid mapping "The" -> "A"
+                    if len(f_part) > 2 and f_part[0].isupper():
+                        partial_map[f_part] = real_parts[i]
+
+            # Strategy 2: Last Word Fallback (Best for "Madison Jackson" -> "Dr. Sarah Johnson")
+            # If lengths differ, the Last Name is usually the safest anchor.
+            elif len(fake_parts) > 1 and len(real_parts) > 0:
+                f_last = fake_parts[-1]
+                r_last = real_parts[-1]
+                if len(f_last) > 2 and f_last[0].isupper():
+                    partial_map[f_last] = r_last
+
+            # Strategy 3: Organization Root Word (Best for Emails)
+            # If fake is "Kennethburgh General Hospital", map "Kennethburgh" -> "Blue Cross"
+            # This fixes hallucinated emails like "support@kennethburghhealth.org"
+            if len(fake_parts) > 0 and len(fake_parts[0]) > 5:
+                # Store root word mapping
+                partial_map[fake_parts[0]] = real_full
+
+    # --- 3. Apply Phone Number Fixes (Regex) ---
+    # Captures various formats: +1-555... | (555)... | 555.555... | 555 555...
+    # \W matches non-word chars, including unicode hyphens the LLM might use
+    phone_pattern = r'(?:\+?1[\W_]?)?\(?\d{3}\)?[\W_]?\d{3}[\W_]?\d{4}'
+
+    def phone_replacer(match):
+        found_num = match.group(0)
+        found_digits = get_digits(found_num)
+        # Check if the found digits match any of our fake numbers
+        for fake_digits, real_num in phone_map.items():
+            if fake_digits in found_digits:
+                return real_num
+        return found_num
+
+    text = re.sub(phone_pattern, phone_replacer, text)
+
+    # --- 4. Apply Partial Text Fixes (Regex Boundaries) ---
+    # Sort keys by length to replace "Kennethburgh" before "Ken"
+    for fake_part, real_part in sorted(partial_map.items(), key=lambda x: len(x[0]), reverse=True):
+        # Case 1: Word Boundary Match (Preserves whole words)
+        # Matches "Joanna" in "Hello Joanna," but not in "Joannasaurus"
+        pattern = r'\b' + re.escape(fake_part) + r'\b'
+        text = re.sub(pattern, real_part, text)
+
+        # Case 2: Aggressive Org Cleanup (Case-Insensitive)
+        # Handles the email domain issue: "info@kennethburghhealth.org"
+        # If we have a long unique keyword (like Kennethburgh), replace it even inside other strings
+        if len(fake_part) > 5:
+            # Collapse spaces in real_part for email compatibility (Blue Cross -> BlueCross)
+            clean_real = real_part.replace(" ", "")
+            text = re.sub(re.escape(fake_part), clean_real, text, flags=re.IGNORECASE)
+
+    return {"restored_text": text}
 
 
 if __name__ == "__main__":

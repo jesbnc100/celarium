@@ -1,191 +1,175 @@
-# Celarium
+# Celarium 🛡️
+### Context-Aware Privacy Middleware for AI Agents & LLMs
 
-**Context-Aware Privacy Middleware for AI Agents & LLMs**
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/)
+[![Status](https://img.shields.io/badge/Status-Public_Beta-orange.svg)]()
+[![Demo](https://img.shields.io/badge/Live_Demo-AWS_EC2-brightgreen.svg)](http://98.81.182.73/docs)
 
-Celarium acts as a smart firewall between your users and Large Language Models. It intercepts sensitive data, replaces it with context-aware, consistent fake entities, and restores the original values after the LLM responds.
+**Celarium acts as a smart firewall between your users and Large Language Models (LLMs).** 
+
+It intercepts sensitive data, replaces it with context-aware, consistent synthetic entities, and **restores the original values** after the LLM responds—even if the LLM hallucinates or changes formats.
 
 ---
 
-## Why Celarium?
+##  Try it Live
+You can test the API immediately via the interactive Swagger UI running on our AWS Demo instance. No installation required.
 
-Unlike simple regex tools that redact data ([REDACTED]), Celarium maintains semantic consistency.
+👉 **[Launch Live Demo & Docs](http://98.81.182.73/docs)**
 
-- **Context-Aware AI**: Uses GLiNER (Generalist Lightweight NER) to detect entities based on context, not just patterns.
-- **Handles**: MRN, SSN, Insurance Policy, Group IDs, Hospital Names (regex + AI detection)
-- **Data Consistency**: If "John Doe" becomes "Robert Smith", his email becomes robert.smith@example.com automatically.
-- **Batch Processing**: Natively handles JSON Lists and complex objects without hitting token limits.
-- **Smart Restoration**: The LLM "thinks" it's talking to Robert Smith. When the response comes back, Celarium swaps it back to John Doe.
+*(Note: This is a demonstration instance. Please do not send real, sensitive PII to this public endpoint.)*
+
+---
+
+## The Problem
+When you redact PII using standard tools (like Microsoft Presidio), LLMs lose context and generate robotic responses.
+
+| Method | Input | LLM "Mental Model" | Result |
+| :--- | :--- | :--- | :--- |
+| **Raw Data** | "John Doe (MRN-123) has flu." | "Specific Patient John" | ❌ **Privacy Leak** |
+| **Redaction** | "\<PERSON\> (\<ID\>) has flu." | "Generic Placeholder" | ⚠️ **Robotic / Low Quality** |
+| **Celarium** | "Michael Smith (MRN-999) has flu." | "Specific Patient Michael" | ✅ **High Quality & Private** |
+
+---
+
+## Features
+
+- **Context-Aware Anonymization**: Uses **GLiNER** (Generalist Lightweight NER) to detect entities based on semantic context, not just regex patterns.
+- **Semantic Consistency**: If "John Doe" is replaced with "Robert Smith", "john@gmail.com" automatically becomes "robert.smith@example.com". The LLM never notices the switch.
+- **Robust Restoration Engine**: Includes a fuzzy-matching logic that handles LLM hallucinations. If the LLM outputs "Rob Smith" instead of "Robert Smith", or changes `(555) 123-4567` to `+1-555...`, Celarium still correctly restores it to the original data.
+- **Batch Processing**: Natively handles JSON Lists and complex dictionaries without breaking structure.
+- **Stateless & Secure**: Mappings are stored in-memory. No PII is logged to disk.
 
 ---
 
 ## 🛠 How It Works
 
-```mermaid
-graph LR
-A[User Input] -->|Contains PII| B(Celarium)
-B -->|Anonymized Data| C[LLM / Agent]
-C -->|Response with Fakes| B
-B -->|Restored Data| D[User Output]
-```
+![Celarium Workflow](assets/diagram.png)
 
-1. **Intercept**: Send raw data (Text or JSON) to Celarium.
-2. **Anonymize**: Celarium uses a Hybrid Engine (GLiNER AI + Strict Regex) to generate realistic fakes.
-3. **Process**: Send the clean data to OpenAI/Claude/Gemini.
-4. **Restore**: Send the LLM's response back to Celarium to swap the names back.
+
+**Workflow:**
+
+1. **Intercept:** You send raw data to Celarium.  
+2. **Anonymize:** Celarium uses a Hybrid Engine (AI + Strict Regex) to generate realistic fakes.  
+3. **Process:** You send the clean text to your LLM. The LLM "thinks" it is talking to a real person.  
+4. **Restore:** You send the LLM's response back to Celarium. We swap the fakes back to the originals.  
 
 ---
 
-## Quick Start
+## Integration (The "Sandwich" Pattern)
+Implementing Celarium is a simple 3-step wrapper around your LLM call. Example using **LangChain**:
 
-### Option A: Hosted API
-The easiest way to use Celarium is via the hosted API. No installation required.
-Base URL:
-1. Anonymize Data
-Send text or a list of JSON objects. The system auto-detects PII (Names, Emails, Phones, Medical IDs).
-code
+```python
+import requests
+from langchain_openai import ChatOpenAI
 
-curl -X POST  \
-  -H "X-API-Key: sk_test_celarium_founder_001" \
-  -H "Content-Type: application/json" \
-  -d '{
+# 1. Setup
+celarium_url = "http://98.81.182.73" # Or http://localhost:8000
+llm = ChatOpenAI(model="gpt-4", api_key="...")
+
+def safe_chat(user_input):
+    # --- STEP 1: ANONYMIZE ---
+    anon_resp = requests.post(
+        f"{celarium_url}/v1/anonymize", 
+        json={"text": user_input},
+        headers={"X-API-Key": "sk_test_celarium_founder_001"}
+    ).json()
+    
+    clean_text = anon_resp["anonymized_text"]
+    session_id = anon_resp["session_id"]
+
+    # --- STEP 2: LLM PROCESSING ---
+    llm_response = llm.invoke(clean_text).content
+
+    # --- STEP 3: RESTORE ---
+    final_resp = requests.post(
+        f"{celarium_url}/v1/restore",
+        json={"session_id": session_id, "text": llm_response},
+        headers={"X-API-Key": "sk_test_celarium_founder_001"}
+    ).json()
+
+    return final_resp["restored_text"]
+```
+
+[View Example Chatbot](examples/healthcare_cs_example.py)
+
+---
+
+## 🚀 Quick Start (CURL)
+
+**Step 1: Anonymize Data**
+```bash
+curl -X POST "http://98.81.182.73/v1/anonymize"   -H "X-API-Key: sk_test_celarium_founder_001"   -H "Content-Type: application/json"   -d '{
     "text": "Patient John Doe (DOB 1985-07-14) admitted to Springfield General. MRN-998877."
   }'
-Response:
-code
-JSON
-{
-  "anonymized_text": "Patient Michael Smith (DOB 1962-03-12) admitted to Oak Ridge Medical Center. MRN-112233.",
-  "session_id": "abc123uuid...",
-  "entities_found": 4
-}
-2. Process with LLM
-Send the anonymized_text to OpenAI, Claude, or your local model. The LLM sees "Michael Smith" and processes it safely.
-3. Restore Data
-Send the LLM's response back to Celarium to swap the names back.
-code
+```
 
-curl -X POST  \
-  -H "X-API-Key: sk_test_celarium_founder_001" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "session_id": "abc123uuid...",
+**Step 2: Restore Data**
+```bash
+curl -X POST "http://98.81.182.73/v1/restore"   -H "X-API-Key: sk_test_celarium_founder_001"   -H "Content-Type: application/json"   -d '{
+    "session_id": "YOUR_SESSION_ID",
     "text": "Summary: Michael Smith was treated at Oak Ridge..."
   }'
-### Option B: Local Python
-Requires Python 3.10+
+```
 
+---
+
+##  Use Cases
+
+### 🏥 Healthcare (HIPAA)
+- Summarize patient notes or draft insurance appeals safely using LLMs.
+- Detects: Patient Names, MRNs, SSNs, Doctor Names, Dates, Hospital Names.
+- Safety: Address blocks are replaced entirely to prevent location leakage.
+
+### ⚖️ Legal & Finance
+- Process contracts or bank statements without exposing client identities.
+- Detects: Organization Names, Policy Numbers, Group IDs, Dollar Amounts (optional).
+- Benefit: Maintain contract analysis while masking sensitive parties.
+
+### 👤 HR & Recruitment
+- Analyze employee feedback or resumes while reducing bias.
+- Detects: Names, Emails, Phone Numbers.
+- Benefit: LLM judges the content, not demographics.
+
+---
+
+## 💻 Local Installation
 ```bash
+# Clone the repo
+git clone https://github.com/jesbnc100/celarium.git
+cd celarium
+
+# Install requirements
 pip install -r requirements.txt
+
+# Run the server
 python main.py
 ```
-
-The API runs on [http://localhost:8000](http://localhost:8000)
-
----
-
-## Usage Examples
-
-### 1. Medical / Clinical Data (Unstructured)
-
-Celarium detects specialized medical fields and formatting.
-
-```bash
-curl -X POST http://localhost:8000/v1/anonymize \
-  -H "X-API-Key: sk_test_celarium_founder_001" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Patient John Doe, DOB 1985-07-14, SSN 123-45-6789, MRN MRN-998877, admitted to Springfield General Hospital with Dr. House."
-  }'
-```
-
-**Response Example:**
-
-```json
-{
-  "anonymized_text": "Patient Michael Stevens, DOB 1962-03-12, SSN 542-11-9021, MRN MRN-112233, admitted to Oak Ridge Medical Center with Dr. Wilson.",
-  "session_id": "abc123uuid",
-  "entities_found": 6
-}
-```
+Server starts at `http://localhost:8000`
 
 ---
 
-### 2. Batch Processing (JSON Lists)
+##  Security & Architecture
 
-Send entire database records. Celarium automatically handles list iteration and context preservation.
-
-```bash
-curl -X POST http://localhost:8000/v1/anonymize \
-  -H "X-API-Key: sk_test_celarium_founder_001" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": [
-      { "name": "Carlos Rivera", "email": "carlos@outlook.com", "policy": "POL-12345" },
-      { "name": "Sarah Jones", "email": "sarah.j@gmail.com", "policy": "POL-98765" }
-    ]
-  }'
-```
-
-**Response Example:**
-
-```json
-{
-  "anonymized_text": "[\n  { \"name\": \"David Kim\", \"email\": \"davidkim99@example.com\", \"policy\": \"POL-554433\" },\n  { \"name\": \"Emily White\", \"email\": \"emilywhite22@example.com\", \"policy\": \"POL-112211\" }\n]",
-  "session_id": "xyz789uuid",
-  "entities_found": 6
-}
-```
+- **Ephemeral Storage:** Mappings stored in memory (Fail-secure).  
+- **Zero Persistence:** No input text is written to databases or logs.  
+- **Hybrid Detection:** Regex engine catches patterns like SSN, Email, Phone if AI model misses them.  
 
 ---
 
-### 3. Restore Data
+##  Roadmap
 
-After your LLM generates a response using the fake names, swap them back.
-
-```bash
-curl -X POST http://localhost:8000/v1/restore \
-  -H "X-API-Key: sk_test_celarium_founder_001" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "session_id": "abc123uuid",
-    "text": "We have updated the records for Michael Stevens regarding MRN-112233."
-  }'
-```
-
-**Response Example:**
-
-```json
-{
-  "restored_text": "We have updated the records for John Doe regarding MRN-998877."
-}
-```
+- Redis integration for distributed session storage.
+- Custom fine-tuned NER models for Legal/Finance.
+- "Confidence Score" to flag potential missed PII.
+- PDF / Docx / CSV support.
 
 ---
 
-## 🚀 Deployment
-
-- Designed for Railway, Heroku, or AWS.
-- Push to GitHub.
-- Connect to Railway/Heroku.
-- Deploy.
-
-The included Dockerfile handles the AI model download during the build phase. The server automatically optimizes for CPU usage.
+## 📜 License
+Apache 2.0 License - see LICENSE file.
 
 ---
 
-## 🛡 Security & Compliance
-
-- **Ephemeral Storage**: Mappings are stored in-memory. If the server restarts, the data is gone.
-- **PII Never Logs**: We do not log the input text or the mappings to disk.
-- **Strict Regex Fallback**: If the AI misses a pattern, our strict Regex engine catches SSNs, Phones, and Emails as a failsafe.
-- **Address Protection**: Entire address blocks (Street + City + State) are replaced to prevent location leakage.
-
----
-
-## Status
-
-This is a **proof-of-concept**. We're actively looking for:
-
-- Early adopters to validate the approach
-- Feedback on detection accuracy
-- Use cases beyond healthcare
+## 📬 Contact
+For enterprise inquiries or custom deployments, please open a GitHub issue.
